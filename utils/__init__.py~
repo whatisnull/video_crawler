@@ -1,0 +1,200 @@
+# -*- coding: utf-8 -*-
+
+from MySQLdb import OperationalError
+from MySQLdb.cursors import SSCursor, Cursor
+#from lxml import html
+#from tidylib import tidy_document
+import MySQLdb
+import StringIO
+import cookielib
+import gzip
+import re
+import settings as default_settings
+import unittest
+import urllib
+import urllib2
+import hashlib
+from random import choice
+global headers
+
+headers = {
+    'User-Agent'     : 'Mozilla/4.0 (compatible; MSIE 6.0; Windows NT 5.1; SV1)',
+    'Accept'         : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-us,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate',
+    'Accept-Charset' : 'ISO-8859-1,utf-8;q=0.7,*;q=0.7',
+    'Keep-Alive'     : '115',
+    'Connection'     : 'keep-alive',
+    'Cache-Control'  : 'max-age=0'
+}
+
+cookie=cookielib.CookieJar()
+opener=urllib2.build_opener(urllib2.HTTPCookieProcessor(cookie))
+urllib2.install_opener(opener)
+
+def request(uri, data, headers=headers):
+    if data:
+        data = urllib.urlencode(data)
+    request = urllib2.Request(uri, data, headers)
+    request.add_header("Accept-encoding", "gzip")
+    usock = urllib2.urlopen(request,timeout=20)
+    page_data = usock.read()
+    if usock.headers.get('content-encoding', None) == 'gzip':
+        page_data = gzip.GzipFile(fileobj=StringIO.StringIO(page_data)).read()
+#    print usock.headers
+#    headers['Cookie']  = usock.headers.get('set-cookie',None)
+    return usock.headers.get('content-type'), usock.headers.get('content-length'), page_data
+
+def fetch(uri, headers = choice([headers])):
+    return request(uri, None, headers)
+
+def parse_page(page_text):
+    page_element = html.fromstring(page_text)
+    return page_element
+
+def get_page_element(query_url):
+    type, body = fetch(query_url)
+    if type == 'text/html':
+        page = html.fromstring(tidy(body.decode('gb18030', 'ignore')))
+        return page
+    else:
+        return body
+
+def download(url, filename=None):
+    content = fetch(url)
+    if not filename:
+        filename = url.split('/')[-1]
+    return save_to_file(content, filename)
+
+def save_to_file(content, filename):
+    with open(filename, 'w') as writer:
+        writer.write(content)
+    return content
+
+def uniq(array):
+    d = {}
+    a = []
+    for i in array:
+        if i not in d:
+            d[i] = i
+            a.append(i)
+    return a
+
+def compact(array):
+    a = []
+    for i in array:
+        if i:
+            a.append(i)
+    return a
+
+tidy_options = { 
+   'char-encoding':   'utf8', 
+   'output-encoding': 'utf8',
+   'input-encoding':  'utf8',
+   'fix-uri': 'no'
+}
+
+def tidy(page_text):
+    try:
+        document, _ = tidy_document(page_text, tidy_options)
+    except:
+        import sys, traceback
+        t, v, tb = sys.exc_info()
+        print "%s,%s,%s" % (t, v, traceback.format_tb(tb))
+        document = page_text
+    return document
+
+
+def get_url_sign(url):
+    md5 = hashlib.md5()
+    md5.update(url)
+    return md5.hexdigest()
+
+class CursorWrapper(object):
+
+    def __init__(self, parent_cursor_wrapper=None, use_server_side_cursor=False, settings=default_settings):
+        self.cursor_wrapper_stack = []
+        self.use_server_side_cursor = use_server_side_cursor
+        
+        self.settings = settings
+
+        if parent_cursor_wrapper is not None:
+            self.cursor_wrapper_stack.extend(parent_cursor_wrapper.cursor_wrapper_stack)
+        self.cursor_wrapper_stack.append(self)
+
+        if parent_cursor_wrapper is None:
+            self.reconnect()
+        else:
+            self.conn, self.cursor = None, parent_cursor_wrapper.cursor
+        
+
+    def close(self):
+        if self.conn is not None:
+            self.cursor.close()
+            self.conn.close()
+
+    def _get_connection_cursor(self):
+        cursor_class = Cursor
+        if self.use_server_side_cursor:
+            cursor_class = SSCursor
+        
+        conn = MySQLdb.connect(host=self.settings.db_host, user=self.settings.db_user, 
+                               passwd=self.settings.db_passwd, db=self.settings.db_name,
+                               cursorclass=cursor_class,
+                               charset='utf8', use_unicode=True)
+        cursor = conn.cursor()
+        return conn, cursor
+
+    def execute(self, sql, parameters=None, retry_times=0):
+        try:
+            return self.cursor.execute(sql, parameters)
+        except OperationalError, e: # Exceptions on DB server
+            if retry_times < 10:
+                import traceback, sys
+                t, v, tb = sys.exc_info()
+                logger.error("CursorError: 2006, MySQL server has gone away | retry for the %s time" % (retry_times + 1))
+                logger.error("%s,%s,%s" % (t, v, traceback.format_tb(tb)))
+                self.reconnect()
+                return self.execute(sql, parameters, retry_times + 1)
+            else:
+                raise e
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+    
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+    def reconnect(self):
+        conn, cursor = self._get_connection_cursor()
+        self.cursor_wrapper_stack[0].conn = conn
+        for cursor_wrapper in self.cursor_wrapper_stack:
+            cursor_wrapper.cursor = cursor
+
+
+class TestGet(unittest.TestCase):
+
+
+    def test_get_data_of_uri(self):
+        type, page_text = fetch('http://www.baidu.com')
+        self.assertTrue(page_text.index('baidu.com') != -1)
+
+#    def test_get_page_element(self):
+#        page = get_page_element("http://www.baidu.com/s?wd=%B5%B0%CC%A2&f=12&rsp=0&oq=%B5%B0%CB%FA")
+#        self.assertTrue(len(page))
+
+    def test_get_mtime_with_gzip_support(self):
+        type, page_text = fetch('http://www.mtime.com/')
+        self.assertTrue(page_text.index('时光') != -1)
+
+    def test_get_photo(self):
+        type, body = fetch('http://i2.dpfile.com/2011-05-11/7829651_m.jpg')
+        self.assertTrue("image" in type)
+        self.assertTrue(len(body))
+
+
+if __name__ == '__main__':
+#    unittest.main()
+    print choice(['2','4'])
+    print 
+    fetch('')
